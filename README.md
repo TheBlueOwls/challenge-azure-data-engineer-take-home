@@ -7,6 +7,7 @@
 | **Tech Stack** | Python, PySpark, SQL, Jupyter Lab |
 | **Deliverable** | Public GitHub repository |
 | **Data Source** | Blue Owls Data API (credentials provided separately) |
+| **Expected Time** | 5–8 hours |
 
 ---
 
@@ -19,6 +20,8 @@
 You are a data engineer joining a retail analytics team at Blue Owls Solutions. A partner company has exposed their e-commerce data through a set of internal APIs. Your job is to build a data pipeline that ingests this data, transforms it through a medallion architecture, and produces a star schema for analytics.
 
 The underlying data is based on the Olist Brazilian E-Commerce dataset and is served through our data API. The API is intentionally imperfect — it simulates real-world conditions including intermittent failures, authentication challenges, and occasional data quality issues.
+
+We are not looking for perfection. We are looking for someone who builds resilient systems, thinks clearly about data, and can articulate their decisions. A pipeline that handles failures gracefully and is clearly reasoned is worth more to us than one that is technically complete but brittle or opaque.
 
 ---
 
@@ -59,7 +62,7 @@ Build an ingestion layer in Python that pulls data from all API endpoints. Your 
 
 Save the raw ingested data as your Bronze layer (CSV files in a `bronze/` folder). Add an `_ingested_at` timestamp column and `_source_endpoint` column to each file.
 
-**Data management strategy:** Bronze is append-only — each pipeline run adds new records without modifying or overwriting existing data. Your ingestion logic should ensure that re-running the pipeline does not create duplicates for that date ensuring historisation.
+**Data management strategy:** Bronze is append-only — each pipeline run appends new records without overwriting existing data. To prevent duplicates across runs, track which pages or date ranges have already been successfully ingested (e.g. via a simple manifest file or by checking existing records before writing). Re-running the pipeline for the same date range should produce no new rows in Bronze.
 
 ---
 
@@ -83,12 +86,12 @@ Implement the following star schema as your Gold layer. The model is fully defin
 | order_status | string | orders |
 | price | decimal | order_items |
 | freight_value | decimal | order_items |
-| payment_value | decimal | Summed from payments for this order, distributed proportionally across items |
-| payment_type | string | payments (primary payment method for the order) |
-| payment_installments | integer | payments |
-| days_to_deliver | integer | Calculated: delivered_customer_date − purchase_timestamp |
-| days_delivery_vs_estimate | integer | Calculated: delivered_customer_date − estimated_delivery_date |
-| is_late_delivery | boolean | True if days_delivery_vs_estimate > 0 |
+| payment_value | decimal | Total payment for the order (from payments), distributed across items proportionally by item `price`. If an order has 3 items priced at $10, $20, $70, they receive 10%, 20%, 70% of the order's total payment_value respectively. |
+| payment_type | string | payments — use the payment type with the highest `payment_value` for the order; if tied, take the first alphabetically |
+| payment_installments | integer | payments — use the maximum installment count across payment rows for the order |
+| days_to_deliver | integer | Calculated: delivered_customer_date − purchase_timestamp. Null if order not yet delivered. |
+| days_delivery_vs_estimate | integer | Calculated: delivered_customer_date − estimated_delivery_date. Positive = late, negative = early. Null if not delivered. |
+| is_late_delivery | boolean | True if days_delivery_vs_estimate > 0. Null if not delivered. |
 
 ### Dimension: `dim_customers`
 
@@ -98,12 +101,12 @@ Implement the following star schema as your Gold layer. The model is fully defin
 |---|---|---|
 | customer_key | integer | Surrogate key |
 | customer_unique_id | string | customers (deduplicate on this, not customer_id) |
-| customer_city | string | customers (most recent order's location) |
-| customer_state | string | customers (most recent order's location) |
-| customer_zip_code_prefix | string | customers |
-| first_order_date | date | Derived from orders |
-| total_orders | integer | Count of distinct orders |
-| total_spend | decimal | Sum of price + freight from order_items |
+| customer_city | string | customers — use the city from the customer's most recent order by purchase_timestamp |
+| customer_state | string | customers — use the state from the customer's most recent order |
+| customer_zip_code_prefix | string | customers — use from most recent order |
+| first_order_date | date | Earliest purchase_timestamp across all orders for this customer |
+| total_orders | integer | Count of distinct order_ids |
+| total_spend | decimal | Sum of price + freight_value from order_items, across all orders |
 | is_repeat_customer | boolean | True if total_orders > 1 |
 
 ### Dimension: `dim_products`
@@ -114,9 +117,9 @@ Implement the following star schema as your Gold layer. The model is fully defin
 |---|---|---|
 | product_key | integer | Surrogate key |
 | product_id | string | products |
-| product_category_name | string | products (handle nulls as "unknown") |
+| product_category_name | string | products — use "unknown" for null values |
 | product_weight_g | decimal | products |
-| product_volume_cm3 | decimal | Calculated: length × height × width |
+| product_volume_cm3 | decimal | Calculated: product_length_cm × product_height_cm × product_width_cm. Null if any dimension is missing. |
 | product_photos_qty | integer | products |
 | product_description_length | integer | products |
 
@@ -156,17 +159,17 @@ Clean and standardize each source table individually:
 - Handle nulls (document your strategy per field)
 - Cast columns to correct types (dates as dates, decimals as decimals)
 - Remove exact duplicate rows
-- Flag records with data quality issues in a boolean `_is_valid` column (e.g., orders with delivery date before purchase date, negative prices, missing required foreign keys)
+- Flag records with data quality issues in a boolean `_is_valid` column. Examples of invalid records: orders where `delivered_customer_date` is before `purchase_timestamp`, negative prices, order items with no matching order_id.
 
-**Data management strategy:** Silver reflects the current state of each record — implement upsert logic using the natural key of each table so that re-processing updates existing records rather than duplicating them.
+**Data management strategy:** Silver reflects the current state of each record. Implement upsert logic using the natural key of each table (e.g. `order_id` for orders, `product_id` for products) so that re-processing updates existing records rather than creating duplicates. Bronze's append-only approach feeds into Silver's deduplicated current-state view.
 
 ### Gold Layer
 
 Build the four tables exactly as specified in Part 2. Requirements:
 
-- All surrogate keys should be deterministic (reproducible across runs)
-- All foreign key relationships should be valid — no orphan keys
-- Include a brief validation step in your code that prints record counts per table and checks referential integrity
+- All surrogate keys should be deterministic and reproducible across runs (e.g. using a hash of the natural key rather than a sequential row number)
+- All foreign key relationships should be valid — no orphan keys in the fact table
+- Include a brief validation step in your code that prints record counts per table and confirms that all `customer_key`, `product_key`, and `seller_key` values in `fact_order_items` exist in their respective dimension tables
 
 ---
 
@@ -174,30 +177,32 @@ Build the four tables exactly as specified in Part 2. Requirements:
 
 Write SQL queries against your Gold layer tables. These should be compatible with Spark SQL or T-SQL. For each query, include a brief comment explaining your approach.
 
-### Query 1 — Revenue Trend Analysis with Ranking
+### Query 1 — Revenue Trend Analysis with Ranking (Required)
 
 For each product category, calculate monthly revenue (price + freight_value) and rank categories within each month by revenue. Then for the top 5 categories by overall revenue, show their month-over-month revenue growth percentage and a 3-month rolling average of revenue. Only include months where the category had at least 10 transactions.
 
 **Expected output columns:** `product_category_name, year, month, monthly_revenue, monthly_rank, mom_growth_pct, rolling_3m_avg_revenue`
 
-### Query 2 — Seller Performance Scorecard
+### Query 2 — Seller Performance Scorecard (Stretch)
 
-Build a seller scorecard that ranks sellers on a composite score. For each seller, calculate late delivery rate (percentage of orders where `is_late_delivery = true`), average `days_delivery_vs_estimate`, total revenue, and order count. Compute a percentile rank for each metric across all sellers (higher is better — invert ranking for late delivery rate and `days_delivery_vs_estimate` so lower values get higher percentiles). Only include sellers with at least 20 orders. Create a `composite_score` as a weighted average: on-time delivery percentile 40%, delivery speed percentile 30%, revenue percentile 30%.
+Build a seller scorecard that ranks sellers on a composite score. For each seller, calculate: late delivery rate (percentage of orders where `is_late_delivery = true`), average `days_delivery_vs_estimate`, total revenue, and order count. Compute a percentile rank for each metric across all sellers — invert the ranking for `late_delivery_rate` and `avg_days_vs_estimate` so that lower values yield higher percentiles. Only include sellers with at least 20 orders. Compute a `composite_score` as a weighted average: on-time delivery percentile (40%), delivery speed percentile (30%), revenue percentile (30%).
 
 **Expected output columns:** `seller_id, seller_state, total_orders, total_revenue, late_delivery_rate, avg_days_vs_estimate, on_time_pctl, speed_pctl, revenue_pctl, composite_score, overall_rank`
+
+> Query 1 is required. Query 2 is a stretch goal — attempt it if time allows, and don't let it crowd out the pipeline work.
 
 ---
 
 ## Part 5 — README & Technical Decisions (Weight: 15%)
 
-Include a brief README (1–2 pages) covering:
+Include a brief README (1–2 pages) in your submission covering:
 
 - Your technical decisions and the reasoning behind them
 - How you handled API failures and what your retry/resilience strategy is
 - Assumptions you made and any trade-offs you weighed
-- What you'd change or add for a production deployment on Azure/Fabric (scheduling, monitoring, CI/CD, security, cost optimization)
+- What you would change or add for a production deployment on Azure or Microsoft Fabric (scheduling, monitoring, CI/CD, security, cost optimisation)
 
-Be specific rather than generic. We value concrete reasoning over buzzwords.
+Be specific rather than generic. A concrete explanation of one real decision — and what you considered before making it — is worth more than a list of buzzwords.
 
 ---
 
@@ -210,7 +215,7 @@ Be specific rather than generic. We value concrete reasoning over buzzwords.
 
 Additional requirements:
 
-- **Your entire pipeline must be implemented in Jupyter notebooks using PySpark** — see [GETTING_STARTED.md](GETTING_STARTED.md) for how to set up the environment
+- **Your entire pipeline must be implemented in Jupyter notebooks using PySpark** — see [GETTING_STARTED.md](GETTING_STARTED.md) for environment setup
 - Include a `requirements.txt` for any packages your code depends on beyond what the notebook image provides
 - Notebooks should run end-to-end against the provided API without manual intervention
 - Do not commit the raw dataset files — your pipeline should pull from the API
@@ -221,15 +226,18 @@ Additional requirements:
 
 We assess the following, roughly in order of importance:
 
-- **Resilience and error handling** — how your code deals with the imperfect API
-- **Pipeline correctness** — does the Gold layer match the prescribed schema with valid data?
-- **PySpark code quality** — modular, readable, well-structured
-- **SQL correctness and analytical depth**
-- **Clarity of communication in the README**
+| Area | What we look for |
+|---|---|
+| **Resilience & error handling** | Does the pipeline recover from API failures without crashing or producing corrupt data? |
+| **Pipeline correctness** | Does the Gold layer match the prescribed schema with valid data and no orphan keys? |
+| **PySpark code quality** | Is the code modular, readable, and clearly structured across notebooks? |
+| **SQL correctness** | Is Query 1 correct? Does Query 2 demonstrate analytical depth? |
+| **Communication** | Does the README explain real decisions with concrete reasoning? |
 
-We are not looking for perfection. We are looking for someone who builds resilient systems, thinks clearly about data, and can articulate their decisions.
+**What we don't penalise for:** Not using advanced Spark optimisations (broadcasting, partitioning strategies, caching) — unless you choose to and explain why. Leaving Query 2 incomplete if you've explained your approach.
 
+**What we do penalise for:** Unhandled exceptions that crash the pipeline mid-run. Silent data loss (records dropped with no logging or explanation). A README that lists technologies without explaining decisions.
 
 ---
 
-*Good luck! We look forward to reviewing your work.*
+*Good luck — we look forward to reviewing your work.*
